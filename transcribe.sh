@@ -126,6 +126,59 @@ print(f'{cost_usd * $EUR_USD:.4f}')
 "
 }
 
+# ── Archivierung ─────────────────────────────────────────────────────────────
+
+archive_file() {
+  local audio_file="$1"
+  local filename=$(basename "$audio_file")
+  local dest="$PROCESSED_FOLDER/$filename"
+
+  # Bereits archiviert (Doppelverarbeitung durch fswatch)?
+  if [ ! -f "$audio_file" ]; then
+    echo -e "${YELLOW}   ↩ Bereits archiviert:${NC} $filename"
+    return 0
+  fi
+
+  # Warten bis kein Prozess die Datei mehr offen hält (ffmpeg Finalisierung)
+  local waited=0
+  while lsof "$audio_file" &>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ $waited -ge 30 ]; then
+      echo -e "${RED}   ⚠️ Timeout: Datei wird noch von einem Prozess gehalten:${NC} $filename"
+      return 1
+    fi
+  done
+
+  # Gleichnamige Datei im Ziel: Präfix mit Zeitstempel
+  if [ -f "$dest" ]; then
+    dest="$PROCESSED_FOLDER/$(date +%H%M%S)_$filename"
+  fi
+
+  # cp + Größenprüfung + rm — robuster als mv bei async Dateisystem-Ops
+  local src_size
+  src_size=$(stat -f%z "$audio_file" 2>/dev/null || echo 0)
+
+  local copy_err
+  copy_err=$(cp "$audio_file" "$dest" 2>&1)
+  if [ $? -ne 0 ]; then
+    echo -e "${RED}   ⚠️ Archivierung fehlgeschlagen:${NC} $filename"
+    echo "      Grund: $copy_err"
+    return 1
+  fi
+
+  local dst_size
+  dst_size=$(stat -f%z "$dest" 2>/dev/null || echo 0)
+  if [ "$src_size" != "$dst_size" ]; then
+    echo -e "${RED}   ⚠️ Größe stimmt nicht überein nach Kopieren — Original behalten${NC}"
+    rm -f "$dest"
+    return 1
+  fi
+
+  rm -f "$audio_file"
+  echo -e "${GREEN}   📁 Archiviert:${NC} processed/$(basename "$dest")"
+}
+
 # ── Verarbeitung ─────────────────────────────────────────────────────────────
 
 process_file() {
@@ -225,23 +278,7 @@ EOF
 
   rm -rf "$tmp_dir"
 
-  # Verarbeitete Datei verschieben (mit Retry für iCloud)
-  local retries=5
-  local moved=false
-  while [ $retries -gt 0 ]; do
-    if mv "$audio_file" "$PROCESSED_FOLDER/$filename" 2>/dev/null; then
-      moved=true
-      break
-    fi
-    sleep 2
-    retries=$((retries - 1))
-  done
-
-  if [ "$moved" = true ]; then
-    echo -e "${GREEN}   📁 Archiviert:${NC} processed/$filename"
-  else
-    echo -e "${RED}   ⚠️ Verschieben fehlgeschlagen:${NC} $filename"
-  fi
+  archive_file "$audio_file"
 }
 
 start_watch() {

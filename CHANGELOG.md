@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.4.0] — 2026-03-27
+
+### Fixed
+- **Archivierung**: `mv` ersetzt durch `cp + Größenprüfung + rm` — verhindert stille Datenverluste
+- **ffmpeg-Finalisierung**: `lsof`-Warten (max 30s) bevor archiviert wird — behebt Fehler wenn m4a-Container noch geschrieben wird
+- **Doppelverarbeitung**: Frühzeitiger Exit wenn Datei bereits archiviert (fswatch kann mehrfach feuern)
+- **Namenskonflikte**: Zeitstempel-Präfix wenn gleichnamige Datei in `processed/` existiert
+- **Fehler-Sichtbarkeit**: Tatsächlicher Fehlergrund statt stummem `2>/dev/null`
+
+---
+
 ## [1.3.0] — 2026-03-27
 
 ### Added
