@@ -187,7 +187,7 @@ Regeln:
 user_prompt = '''Analysiere das folgende Transkript und antworte ausschließlich mit einem JSON-Objekt in diesem Format:
 
 {
-  \"title\": \"Prägnanter Titel (max 60 Zeichen, keine Sonderzeichen außer Bindestrich)\",
+  \"title\": \"Aussagekräftiger Titel (max 60 Zeichen, keine Sonderzeichen außer Bindestrich, keine einzelnen Zahlen oder Buchstaben)\",
   \"topics\": [\"thema1\", \"thema2\"],
   \"summary\": \"1-3 Sätze: Kern des Gesprächs\",
   \"key_points\": [\"Wichtigster Punkt\", \"Zweiter Punkt\"],
@@ -219,8 +219,15 @@ req = urllib.request.Request(
         'content-type': 'application/json'
     }
 )
-with urllib.request.urlopen(req) as r:
-    data = json.load(r)
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.load(r)
+except urllib.error.HTTPError as e:
+    print(f'API-Fehler: HTTP {e.code} — {e.reason}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'API nicht erreichbar: {e}', file=sys.stderr)
+    sys.exit(1)
 
 usage = data.get('usage', {})
 raw = data['content'][0]['text'].strip()
@@ -331,37 +338,34 @@ process_file() {
   duration=$(get_duration "$audio_file")
 
   echo "   🎙️  Transkribiere..."
-  local whisper_formats="txt,json"
   whisper "$audio_file" \
     --model "$model" \
-    --output_format "$whisper_formats" \
-    --output_dir "$tmp_dir" 2>"$tmp_dir/whisper.log"
+    --output_format json \
+    --output_dir "$tmp_dir" > "$tmp_dir/whisper.log" 2>&1
 
-  local txt_file json_file
-  txt_file=$(find "$tmp_dir" -name "*.txt"  | head -1)
+  local json_file
   json_file=$(find "$tmp_dir" -name "*.json" | head -1)
 
-  if [ ! -f "$txt_file" ]; then
+  if [ ! -f "$json_file" ]; then
     echo -e "${RED}   ❌ Transkription fehlgeschlagen${NC}"
+    cat "$tmp_dir/whisper.log" | tail -5 | sed 's/^/      /'
     notify "❌ Transkription fehlgeschlagen" "$filename"
     rm -rf "$tmp_dir"
     return 1
   fi
 
-  # Speaker-Diarization wenn verfügbar, sonst Plain-Text
+  # Sprache direkt aus Whisper-JSON
+  local language
+  language=$(python3 -c "import json,sys; print(json.load(open('$json_file')).get('language','unknown'))" 2>/dev/null || echo "unknown")
+
+  # Speaker-Diarization wenn verfügbar, sonst Text aus JSON
   local transcript
-  if diarization_available && [ -f "$json_file" ]; then
+  if diarization_available; then
     echo "   🗣️  Erkenne Sprecher..."
     transcript=$(build_speaker_transcript "$json_file" "$audio_file")
   else
-    transcript=$(cat "$txt_file")
+    transcript=$(python3 -c "import json,sys; print(json.load(open('$json_file')).get('text','').strip())" 2>/dev/null)
   fi
-
-  # Sprache aus Whisper-Log
-  local language
-  language=$(grep -i "detected language" "$tmp_dir/whisper.log" \
-    | sed 's/.*Detected language: //' | head -1 | tr -d '\r')
-  [ -z "$language" ] && language="unknown"
 
   # Wörter zählen
   local word_count
@@ -375,16 +379,17 @@ process_file() {
   local tokens_in=0 tokens_out=0 cost_eur="0.0000"
   local title="" topics_yaml="[transcript]"
   if [ -f "$tmp_dir/usage.json" ]; then
-    tokens_in=$(python3 -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('input_tokens',  0))")
-    tokens_out=$(python3 -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('output_tokens', 0))")
+    IFS=$'\t' read -r tokens_in tokens_out title topics_yaml < <(python3 - "$tmp_dir/usage.json" << 'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+tin   = d.get('input_tokens', 0)
+tout  = d.get('output_tokens', 0)
+title = d.get('title', '').replace('\t', ' ')
+tags  = '[' + ', '.join(['transcript'] + [t.lower().replace(' ', '-') for t in d.get('topics', [])]) + ']'
+print(f"{tin}\t{tout}\t{title}\t{tags}")
+PYEOF
+    )
     cost_eur=$(calc_cost_eur "$tokens_in" "$tokens_out")
-    title=$(python3 -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('title', ''))")
-    topics_yaml=$(python3 -c "
-import json
-t = json.load(open('$tmp_dir/usage.json')).get('topics', [])
-tags = ['transcript'] + t
-print('[' + ', '.join(tags) + ']')
-")
   fi
 
   # Dateiname: Titel wenn vorhanden, sonst Audio-Basename
@@ -399,24 +404,36 @@ print('[' + ', '.join(tags) + ']')
   local speakers
   speakers=$(echo "$transcript" | grep -o '\*\*Sprecher [A-Z]\*\*' | sort -u | wc -l | tr -d ' ')
   [ "$speakers" -eq 0 ] 2>/dev/null && speakers=""
+  local speakers_line=""
+  [ -n "$speakers" ] && speakers_line="speakers: $speakers"
 
-  cat > "$output_file" << EOF
----
-date: $date
-time: $time
-type: transcript
-source: $filename
-title: "$title"
-model: $model
-duration: "$duration"
-language: $language
-word_count: $word_count
-${speakers:+speakers: $speakers}
-tokens_in: $tokens_in
-tokens_out: $tokens_out
-cost_eur: $cost_eur
-tags: $topics_yaml
----
+  # Frontmatter zusammenbauen — keine Leerzeilen, sauberes YAML
+  {
+    echo "---"
+    echo "date: $date"
+    echo "time: $time"
+    echo "type: transcript"
+    echo "source: $filename"
+    echo "title: \"$title\""
+    echo "model: $model"
+    echo "duration: \"$duration\""
+    echo "language: $language"
+    echo "word_count: $word_count"
+    [ -n "$speakers_line" ] && echo "$speakers_line"
+    echo "tokens_in: $tokens_in"
+    echo "tokens_out: $tokens_out"
+    echo "cost_eur: $cost_eur"
+    echo "tags: $topics_yaml"
+    echo "---"
+    echo ""
+    echo "$summary"
+    echo ""
+    echo "---"
+    echo ""
+    echo "## Vollständiges Transkript"
+    echo ""
+    echo "$transcript"
+  } > "$output_file"
 
 $summary
 
