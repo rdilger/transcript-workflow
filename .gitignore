@@ -1,0 +1,22 @@
+# Audio Dateien
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.ogg
+*.flac
+*.webm
+*.opus
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+/tmp/
+
+# API Keys (niemals committen!)
+.env
+.env.*
