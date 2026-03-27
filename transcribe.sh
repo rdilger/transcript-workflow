@@ -33,27 +33,48 @@ check_dependencies() {
 get_summary() {
   local transcript="$1"
   local response
-  response=$(curl -s https://api.anthropic.com/v1/messages \
-    -H "x-api-key: $ANTHROPIC_API_KEY" \
-    -H "anthropic-version: 2023-06-01" \
-    -H "content-type: application/json" \
-    -d "{
-      \"model\": \"claude-haiku-4-5-20251001\",
-      \"max_tokens\": 1024,
-      \"messages\": [{
-        \"role\": \"user\",
-        \"content\": \"Analysiere dieses Transkript und erstelle eine strukturierte Zusammenfassung. Antworte in der gleichen Sprache wie das Transkript.\n\nFormat:\n## Zusammenfassung\nKurze Übersicht in 2-3 Sätzen.\n\n## Kernpunkte\n- Wichtigste Punkte als Bullets\n\n## Action Items\n- Konkrete Aufgaben oder nächste Schritte (falls vorhanden)\n\nTranskript:\n$transcript\"
-      }]
-    }")
+  response=$(python3 -c "
+import json, urllib.request, os, sys
 
-  echo "$response" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-if 'content' in data:
+transcript = sys.stdin.read()
+prompt = '''Du analysierst Audio-Transkripte (Gespräche, Notizen, Memos). Antworte immer in der gleichen Sprache wie das Transkript.
+
+Erstelle eine strukturierte Zusammenfassung im folgenden Format:
+
+## Zusammenfassung
+1-3 Sätze: Worum geht es? Was ist der Kern des Gesprächs?
+
+## Kernpunkte
+- Die wichtigsten Aussagen oder Themen als Bullets
+- Mindestens 2, maximal 6 Punkte
+
+## Action Items
+- Konkrete Aufgaben oder Entscheidungen (nur wenn vorhanden, sonst weglassen)
+
+Transkript:
+''' + transcript
+
+payload = json.dumps({
+    'model': 'claude-haiku-4-5-20251001',
+    'max_tokens': 1024,
+    'messages': [{'role': 'user', 'content': prompt}]
+}).encode()
+
+req = urllib.request.Request(
+    'https://api.anthropic.com/v1/messages',
+    data=payload,
+    headers={
+        'x-api-key': os.environ['ANTHROPIC_API_KEY'],
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+    }
+)
+with urllib.request.urlopen(req) as r:
+    data = json.load(r)
     print(data['content'][0]['text'])
-else:
-    print('Zusammenfassung nicht verfügbar.')
-"
+" <<< "$transcript" 2>/dev/null || echo "Zusammenfassung nicht verfügbar.")
+
+  echo "$response"
 }
 
 process_file() {
