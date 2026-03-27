@@ -13,10 +13,40 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# ── Hilfsfunktionen ──────────────────────────────────────────────────────────
+
+notify() {
+  local title="$1"
+  local message="$2"
+  osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null || true
+}
+
+get_duration() {
+  local audio_file="$1"
+  local seconds
+  seconds=$(ffprobe -v quiet -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$audio_file" 2>/dev/null)
+  if [ -n "$seconds" ]; then
+    printf "%d:%02d" $(( ${seconds%.*} / 60 )) $(( ${seconds%.*} % 60 ))
+  else
+    echo "unknown"
+  fi
+}
+
+# Whisper-Modell aus Dateiname ableiten: meeting_medium.m4a → medium
+model_from_filename() {
+  local basename="$1"
+  if [[ "$basename" =~ _(tiny|small|medium|large)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "$WHISPER_MODEL"
+  fi
+}
+
 check_dependencies() {
   local missing=()
   command -v whisper &>/dev/null || missing+=("whisper (brew install openai-whisper)")
-  command -v ffmpeg &>/dev/null  || missing+=("ffmpeg (brew install ffmpeg)")
+  command -v ffmpeg  &>/dev/null || missing+=("ffmpeg (brew install ffmpeg)")
 
   if [ -z "$ANTHROPIC_API_KEY" ]; then
     echo -e "${RED}❌ ANTHROPIC_API_KEY nicht gesetzt.${NC}"
@@ -29,6 +59,8 @@ check_dependencies() {
     exit 1
   fi
 }
+
+# ── API-Aufruf ───────────────────────────────────────────────────────────────
 
 get_summary() {
   local transcript="$1"
@@ -77,37 +109,58 @@ with urllib.request.urlopen(req) as r:
   echo "$response"
 }
 
+# ── Verarbeitung ─────────────────────────────────────────────────────────────
+
 process_file() {
   local audio_file="$1"
   local filename=$(basename "$audio_file")
   local basename="${filename%.*}"
   local date=$(date +%Y-%m-%d)
   local time=$(date +%H-%M)
+  local model=$(model_from_filename "$basename")
   local output_file="$OUTPUT_DIR/${date}_${basename}.md"
   local tmp_dir=$(mktemp -d)
 
-  echo -e "${YELLOW}⏳ Verarbeite:${NC} $filename"
+  echo -e "${YELLOW}⏳ Verarbeite:${NC} $filename (Modell: $model)"
   mkdir -p "$OUTPUT_DIR"
   mkdir -p "$PROCESSED_FOLDER"
 
+  # Dauer ermitteln
+  local duration
+  duration=$(get_duration "$audio_file")
+
   echo "   🎙️  Transkribiere..."
   whisper "$audio_file" \
-    --model "$WHISPER_MODEL" \
+    --model "$model" \
     --output_format txt \
-    --output_dir "$tmp_dir" 2>&1
+    --output_dir "$tmp_dir" 2>"$tmp_dir/whisper.log"
 
-  local txt_file=$(find "$tmp_dir" -name "*.txt" | head -1)
+  local txt_file
+  txt_file=$(find "$tmp_dir" -name "*.txt" | head -1)
 
   if [ ! -f "$txt_file" ]; then
     echo -e "${RED}   ❌ Transkription fehlgeschlagen${NC}"
+    notify "❌ Transkription fehlgeschlagen" "$filename"
     rm -rf "$tmp_dir"
     return 1
   fi
 
-  local transcript=$(cat "$txt_file")
+  local transcript
+  transcript=$(cat "$txt_file")
+
+  # Sprache aus Whisper-Log
+  local language
+  language=$(grep -i "detected language" "$tmp_dir/whisper.log" \
+    | sed 's/.*Detected language: //' | head -1 | tr -d '\r')
+  [ -z "$language" ] && language="unknown"
+
+  # Wörter zählen
+  local word_count
+  word_count=$(echo "$transcript" | wc -w | tr -d ' ')
 
   echo "   🤖 Erstelle Zusammenfassung..."
-  local summary=$(get_summary "$transcript")
+  local summary
+  summary=$(get_summary "$transcript")
 
   cat > "$output_file" << EOF
 ---
@@ -115,7 +168,10 @@ date: $date
 time: $time
 type: transcript
 source: $filename
-model: $WHISPER_MODEL
+model: $model
+duration: "$duration"
+language: $language
+word_count: $word_count
 tags: [transcript]
 ---
 
@@ -127,6 +183,12 @@ $summary
 
 $transcript
 EOF
+
+  echo -e "${GREEN}   ✅ Gespeichert:${NC} ${date}_${basename}.md"
+  echo "      Dauer: $duration | Sprache: $language | Wörter: $word_count"
+  notify "✅ Transkript fertig" "$filename · $duration · $word_count Wörter"
+
+  rm -rf "$tmp_dir"
 
   # Verarbeitete Datei verschieben (mit Retry für iCloud)
   local retries=5
@@ -159,9 +221,7 @@ start_watch() {
 
   fswatch -0 "$AUDIO_WATCH_FOLDER" | while IFS= read -r -d '' file; do
     if [[ "$file" =~ \.(mp3|mp4|m4a|wav|ogg|flac|webm|opus)$ ]]; then
-      # Nur Dateien im Hauptordner verarbeiten, nicht im processed/ Unterordner
       if [[ "$file" != *"/processed/"* ]]; then
-        # Warten bis Datei fertig geschrieben ist (Größe stabil)
         sleep 2
         prev_size=0
         curr_size=$(stat -f%z "$file" 2>/dev/null || echo 0)
@@ -176,6 +236,8 @@ start_watch() {
   done
 }
 
+# ── Einstieg ─────────────────────────────────────────────────────────────────
+
 check_dependencies
 
 case "$1" in
@@ -189,6 +251,7 @@ case "$1" in
   "")
     echo "Usage:"
     echo "  ./transcribe.sh audio.mp3"
+    echo "  ./transcribe.sh meeting_medium.m4a   # Modell per Dateiname"
     echo "  ./transcribe.sh --watch"
     exit 1
     ;;
