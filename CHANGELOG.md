@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.5.0] — 2026-03-27
+
+### Changed
+- **Summary-Qualität**: `system`-Parameter mit klarer Rollenanweisung (keine Halluzinationen, Sprache des Transkripts)
+- **Strukturierter JSON-Output**: Claude gibt JSON zurück → zuverlässiges Parsing statt Freitext-Formatierung
+- **Titel-Extraktion**: Claude generiert einen prägnanten Titel → Obsidian-Dateiname z.B. `2026-03-27_Meeting-Q2-Planning.md`
+- **Topics/Keywords**: 2-5 Schlagworte werden als Obsidian-Tags ins Frontmatter geschrieben
+- **Action Items adaptiv**: Sektion erscheint nur wenn tatsächlich Aufgaben vorhanden
+- Kosten-CSV enthält jetzt auch den generierten Titel
+
+---
+
 ## [1.4.0] — 2026-03-27
 
 ### Fixed

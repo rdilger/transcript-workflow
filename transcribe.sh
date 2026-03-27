@@ -68,36 +68,48 @@ check_dependencies() {
 
 # ── API-Aufruf ───────────────────────────────────────────────────────────────
 
-# Schreibt Summary auf stdout, Token-Nutzung als JSON nach $2
+# Analysiert Transkript via Claude.
+# Schreibt Markdown-Summary auf stdout.
+# Schreibt erweiterte Metadaten (tokens + title + topics) als JSON nach $2.
 get_summary() {
   local transcript="$1"
   local usage_file="$2"
   USAGE_FILE="$usage_file" python3 -c "
-import json, urllib.request, os, sys
+import json, urllib.request, os, sys, re
 
 transcript = sys.stdin.read()
 usage_file = os.environ.get('USAGE_FILE', '')
-prompt = '''Du analysierst Audio-Transkripte (Gespräche, Notizen, Memos). Antworte immer in der gleichen Sprache wie das Transkript.
 
-Erstelle eine strukturierte Zusammenfassung im folgenden Format:
+system_prompt = '''Du bist ein präziser Assistent für Audio-Transkript-Analyse.
+Regeln:
+- Antworte immer in der Sprache des Transkripts
+- Schreibe nur was tatsächlich im Transkript steht — keine Ergänzungen
+- Bei sehr kurzem oder unklarem Inhalt: schreib das kurz in die Zusammenfassung'''
 
-## Zusammenfassung
-1-3 Sätze: Worum geht es? Was ist der Kern des Gesprächs?
+user_prompt = '''Analysiere das folgende Transkript und antworte ausschließlich mit einem JSON-Objekt in diesem Format:
 
-## Kernpunkte
-- Die wichtigsten Aussagen oder Themen als Bullets
-- Mindestens 2, maximal 6 Punkte
+{
+  \"title\": \"Prägnanter Titel (max 60 Zeichen, keine Sonderzeichen außer Bindestrich)\",
+  \"topics\": [\"thema1\", \"thema2\"],
+  \"summary\": \"1-3 Sätze: Kern des Gesprächs\",
+  \"key_points\": [\"Wichtigster Punkt\", \"Zweiter Punkt\"],
+  \"action_items\": [\"Aufgabe 1\"]
+}
 
-## Action Items
-- Konkrete Aufgaben oder Entscheidungen (nur wenn vorhanden, sonst weglassen)
+Hinweise:
+- topics: 2-5 Schlagworte, kleingeschrieben, auf Englisch oder Deutsch
+- key_points: mindestens 2, maximal 6 Punkte
+- action_items: nur wenn konkrete Aufgaben/Entscheidungen vorhanden, sonst leeres Array []
+- Antworte NUR mit dem JSON, kein Text davor oder danach
 
 Transkript:
 ''' + transcript
 
 payload = json.dumps({
     'model': 'claude-haiku-4-5-20251001',
-    'max_tokens': 1024,
-    'messages': [{'role': 'user', 'content': prompt}]
+    'max_tokens': 1200,
+    'system': system_prompt,
+    'messages': [{'role': 'user', 'content': user_prompt}]
 }).encode()
 
 req = urllib.request.Request(
@@ -111,11 +123,32 @@ req = urllib.request.Request(
 )
 with urllib.request.urlopen(req) as r:
     data = json.load(r)
-    if usage_file:
-        with open(usage_file, 'w') as f:
-            json.dump(data.get('usage', {}), f)
-    print(data['content'][0]['text'])
-" <<< "$transcript" 2>/dev/null || echo "Zusammenfassung nicht verfügbar."
+
+usage = data.get('usage', {})
+raw = data['content'][0]['text'].strip()
+
+# JSON aus Antwort extrahieren (falls Claude doch Text drumherum schreibt)
+match = re.search(r'\{.*\}', raw, re.DOTALL)
+parsed = json.loads(match.group()) if match else {}
+
+title    = parsed.get('title', '')
+topics   = parsed.get('topics', [])
+summary  = parsed.get('summary', '')
+points   = parsed.get('key_points', [])
+actions  = parsed.get('action_items', [])
+
+# Metadaten für Bash
+if usage_file:
+    with open(usage_file, 'w') as f:
+        json.dump({**usage, 'title': title, 'topics': topics}, f)
+
+# Markdown-Body ausgeben
+md = f'## Zusammenfassung\n{summary}\n\n## Kernpunkte\n'
+md += '\n'.join(f'- {p}' for p in points)
+if actions:
+    md += '\n\n## Action Items\n' + '\n'.join(f'- {a}' for a in actions)
+print(md)
+" <<< "$transcript" 2>&1 || echo "Zusammenfassung nicht verfügbar."
 }
 
 calc_cost_eur() {
@@ -232,13 +265,30 @@ process_file() {
   local summary
   summary=$(get_summary "$transcript" "$tmp_dir/usage.json")
 
-  # Token-Nutzung + Kosten
+  # Token-Nutzung, Kosten, Titel und Topics aus usage.json
   local tokens_in=0 tokens_out=0 cost_eur="0.0000"
+  local title="" topics_yaml="[transcript]"
   if [ -f "$tmp_dir/usage.json" ]; then
-    tokens_in=$(python3  -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('input_tokens',  0))")
+    tokens_in=$(python3 -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('input_tokens',  0))")
     tokens_out=$(python3 -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('output_tokens', 0))")
     cost_eur=$(calc_cost_eur "$tokens_in" "$tokens_out")
+    title=$(python3 -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('title', ''))")
+    topics_yaml=$(python3 -c "
+import json
+t = json.load(open('$tmp_dir/usage.json')).get('topics', [])
+tags = ['transcript'] + t
+print('[' + ', '.join(tags) + ']')
+")
   fi
+
+  # Dateiname: Titel wenn vorhanden, sonst Audio-Basename
+  local slug=""
+  if [ -n "$title" ]; then
+    slug=$(echo "$title" | sed 's/[/\\:*?"<>|]/-/g' | sed 's/  */ /g' | tr ' ' '-')
+  else
+    slug="$basename"
+  fi
+  output_file="$OUTPUT_DIR/${date}_${slug}.md"
 
   cat > "$output_file" << EOF
 ---
@@ -246,6 +296,7 @@ date: $date
 time: $time
 type: transcript
 source: $filename
+title: "$title"
 model: $model
 duration: "$duration"
 language: $language
@@ -253,7 +304,7 @@ word_count: $word_count
 tokens_in: $tokens_in
 tokens_out: $tokens_out
 cost_eur: $cost_eur
-tags: [transcript]
+tags: $topics_yaml
 ---
 
 $summary
@@ -267,14 +318,16 @@ EOF
 
   # Kosten-Log (CSV)
   if [ ! -f "$COSTS_LOG" ]; then
-    echo "date,time,source,duration,language,word_count,tokens_in,tokens_out,cost_eur" > "$COSTS_LOG"
+    echo "date,time,source,title,duration,language,word_count,tokens_in,tokens_out,cost_eur" > "$COSTS_LOG"
   fi
-  echo "$date,$time,$filename,$duration,$language,$word_count,$tokens_in,$tokens_out,$cost_eur" >> "$COSTS_LOG"
+  echo "$date,$time,$filename,\"$title\",$duration,$language,$word_count,$tokens_in,$tokens_out,$cost_eur" >> "$COSTS_LOG"
 
-  echo -e "${GREEN}   ✅ Gespeichert:${NC} ${date}_${basename}.md"
+  local outname=$(basename "$output_file")
+  echo -e "${GREEN}   ✅ Gespeichert:${NC} $outname"
+  [ -n "$title" ] && echo "      Titel: $title"
   echo "      Dauer: $duration | Sprache: $language | Wörter: $word_count"
   echo "      Tokens: ${tokens_in}↑ ${tokens_out}↓ | Kosten: ${cost_eur}€"
-  notify "✅ Transkript fertig" "$filename · $duration · ${cost_eur}€"
+  notify "✅ Transkript fertig" "${title:-$filename} · $duration · ${cost_eur}€"
 
   rm -rf "$tmp_dir"
 
