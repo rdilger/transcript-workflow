@@ -8,11 +8,23 @@ Automatisches Audio-Transkriptions-System für macOS. Nimmt System-Audio auf, tr
 record (Menüleisten-App)
   → Aufnahme via BlackHole (System-Audio)
   → fswatch erkennt neue Datei in AudioInput/
-  → Whisper transkribiert lokal
-  → Claude API erstellt Zusammenfassung
+  → Whisper transkribiert lokal (Modell ggf. aus Dateiname)
+  → Claude API erstellt Zusammenfassung + Titel + Tags (JSON)
+  → optional: Speaker Diarization via pyannote.audio
   → .md mit Frontmatter → Obsidian Vault/Transcripts/
   → Audio-Datei → AudioInput/processed/
+  → Kosten werden in costs.csv geloggt
 ```
+
+## Features
+
+- **Lokale Transkription** via Whisper — kein Cloud-Upload
+- **KI-Zusammenfassung** mit Titel-Generierung und Themen-Tags
+- **Speaker Diarization** (optional): erkennt automatisch wer spricht
+- **Kosten-Tracking**: Token-Nutzung und Kosten pro Transkript, laufendes CSV-Log
+- **Modell per Dateiname**: `meeting_medium.m4a` → Whisper nutzt `medium`
+- **macOS-Notifications** bei Erfolg und Fehler
+- **Erweitertes Frontmatter**: Dauer, Sprache, Wortanzahl, Kosten, Sprecher
 
 ## Voraussetzungen
 
@@ -77,6 +89,17 @@ open ~/Applications/Recorder.app
 App beim Mac-Start automatisch starten:
 **Systemeinstellungen → Allgemein → Anmeldeelemente** → `Recorder.app` hinzufügen
 
+### 7. Speaker Diarization einrichten (optional)
+
+```bash
+pip install pyannote.audio
+echo 'export HF_TOKEN=hf_...' >> ~/.zshrc
+source ~/.zshrc
+```
+
+HuggingFace-Account erforderlich, Terms für [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) akzeptieren.
+Wenn `HF_TOKEN` nicht gesetzt ist, läuft das Script ohne Diarization — kein Breaking Change.
+
 ## Benutzung
 
 - **🎙** in der Menüleiste → Aufnahme starten
@@ -90,6 +113,25 @@ App beim Mac-Start automatisch starten:
 ```bash
 ~/scripts/transcribe.sh /pfad/zur/audio.mp3
 ```
+
+### Whisper-Modell per Dateiname steuern
+
+```bash
+# Standard-Modell (small)
+mv meeting.m4a ~/Desktop/AudioInput/
+
+# Bestimmtes Modell erzwingen
+mv interview_medium.m4a ~/Desktop/AudioInput/
+mv vortrag_large.m4a ~/Desktop/AudioInput/
+```
+
+### Kosten-Übersicht
+
+```bash
+~/scripts/transcribe.sh --costs
+```
+
+Zeigt alle Transkripte tabellarisch mit Dauer, Tokens und Kosten. CSV-Log liegt in `~/Desktop/AudioInput/costs.csv`.
 
 ### Unterstützte Formate
 
@@ -105,6 +147,8 @@ In `transcribe.sh` anpassbar:
 | `VAULT` | iCloud Obsidian Vault | Pfad zum Obsidian Vault |
 | `TRANSCRIPT_FOLDER` | `Transcripts` | Unterordner im Vault |
 | `AUDIO_WATCH_FOLDER` | `~/Desktop/AudioInput` | Ordner für Audio-Input |
+| `COSTS_LOG` | `~/Desktop/AudioInput/costs.csv` | Pfad zum Kosten-Log |
+| `HF_TOKEN` | — | HuggingFace-Token für Speaker Diarization (env var) |
 
 ## Output-Format
 
@@ -115,7 +159,14 @@ time: 14-30
 type: transcript
 source: meeting.m4a
 model: small
-tags: [transcript]
+duration: "04:32"
+language: german
+word_count: 847
+cost_eur: 0.0014
+tokens_in: 1203
+tokens_out: 312
+speakers: 2
+tags: [transcript, Q2-Planung, Budget, Roadmap]
 ---
 
 ## Zusammenfassung
@@ -130,19 +181,16 @@ tags: [transcript]
 ---
 
 ## Vollständiges Transkript
-...
+
+**Sprecher A:** ...
+**Sprecher B:** ...
 ```
+
+> `speakers` und `Action Items` erscheinen nur wenn relevant (Diarization aktiv bzw. Aufgaben vorhanden).
 
 ## Roadmap / Ideen
 
 - [ ] Obsidian MCP Integration (Claude Code Vault-Zugriff)
-- [ ] Frontmatter erweitern (duration, word_count, language, Links)
-- [ ] Speaker Diarization (verschiedene Sprecher unterscheiden)
-- [ ] Modell per Dateiname steuern (`meeting_medium.m4a`)
-- [ ] Kosten-Tracking pro Transkript
-- [ ] Fehler-Notifications via macOS
-- [ ] Processed-Ordner Bug bei iCloud fixen
-- [ ] Summary Qualität verbessern
 
 ## Kosten
 
