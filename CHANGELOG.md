@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.3.0] — 2026-03-27
+
+### Added
+- **Kosten-Tracking**: Token-Nutzung (`tokens_in`, `tokens_out`, `cost_eur`) im Frontmatter jedes Transkripts
+- **Kosten-Log**: läuft als CSV in `~/Desktop/AudioInput/costs.csv` mit — Datum, Datei, Dauer, Tokens, Kosten
+- **`--costs` Flag**: tabellarische Übersicht aller Transkripte mit Gesamtkosten (`./transcribe.sh --costs`)
+- Preise als Konstanten (`HAIKU_PRICE_IN`, `HAIKU_PRICE_OUT`, `EUR_USD`) — leicht anpassbar
+
+---
+
 ## [1.2.0] — 2026-03-27
 
 ### Added

@@ -7,6 +7,12 @@ AUDIO_WATCH_FOLDER="$HOME/Desktop/AudioInput"
 PROCESSED_FOLDER="$HOME/Desktop/AudioInput/processed"
 OUTPUT_DIR="$VAULT/$TRANSCRIPT_FOLDER"
 WHISPER_MODEL="small"
+COSTS_LOG="$HOME/Desktop/AudioInput/costs.csv"
+
+# Claude Haiku Preise (USD pro Token) — bei Preisänderung hier anpassen
+HAIKU_PRICE_IN=0.0000008    # $0.80 / 1M Input-Tokens
+HAIKU_PRICE_OUT=0.000004    # $4.00 / 1M Output-Tokens
+EUR_USD=0.92
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -62,13 +68,15 @@ check_dependencies() {
 
 # ── API-Aufruf ───────────────────────────────────────────────────────────────
 
+# Schreibt Summary auf stdout, Token-Nutzung als JSON nach $2
 get_summary() {
   local transcript="$1"
-  local response
-  response=$(python3 -c "
+  local usage_file="$2"
+  USAGE_FILE="$usage_file" python3 -c "
 import json, urllib.request, os, sys
 
 transcript = sys.stdin.read()
+usage_file = os.environ.get('USAGE_FILE', '')
 prompt = '''Du analysierst Audio-Transkripte (Gespräche, Notizen, Memos). Antworte immer in der gleichen Sprache wie das Transkript.
 
 Erstelle eine strukturierte Zusammenfassung im folgenden Format:
@@ -103,10 +111,19 @@ req = urllib.request.Request(
 )
 with urllib.request.urlopen(req) as r:
     data = json.load(r)
+    if usage_file:
+        with open(usage_file, 'w') as f:
+            json.dump(data.get('usage', {}), f)
     print(data['content'][0]['text'])
-" <<< "$transcript" 2>/dev/null || echo "Zusammenfassung nicht verfügbar.")
+" <<< "$transcript" 2>/dev/null || echo "Zusammenfassung nicht verfügbar."
+}
 
-  echo "$response"
+calc_cost_eur() {
+  local tokens_in="$1" tokens_out="$2"
+  python3 -c "
+cost_usd = $tokens_in * $HAIKU_PRICE_IN + $tokens_out * $HAIKU_PRICE_OUT
+print(f'{cost_usd * $EUR_USD:.4f}')
+"
 }
 
 # ── Verarbeitung ─────────────────────────────────────────────────────────────
@@ -160,7 +177,15 @@ process_file() {
 
   echo "   🤖 Erstelle Zusammenfassung..."
   local summary
-  summary=$(get_summary "$transcript")
+  summary=$(get_summary "$transcript" "$tmp_dir/usage.json")
+
+  # Token-Nutzung + Kosten
+  local tokens_in=0 tokens_out=0 cost_eur="0.0000"
+  if [ -f "$tmp_dir/usage.json" ]; then
+    tokens_in=$(python3  -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('input_tokens',  0))")
+    tokens_out=$(python3 -c "import json; print(json.load(open('$tmp_dir/usage.json')).get('output_tokens', 0))")
+    cost_eur=$(calc_cost_eur "$tokens_in" "$tokens_out")
+  fi
 
   cat > "$output_file" << EOF
 ---
@@ -172,6 +197,9 @@ model: $model
 duration: "$duration"
 language: $language
 word_count: $word_count
+tokens_in: $tokens_in
+tokens_out: $tokens_out
+cost_eur: $cost_eur
 tags: [transcript]
 ---
 
@@ -184,9 +212,16 @@ $summary
 $transcript
 EOF
 
+  # Kosten-Log (CSV)
+  if [ ! -f "$COSTS_LOG" ]; then
+    echo "date,time,source,duration,language,word_count,tokens_in,tokens_out,cost_eur" > "$COSTS_LOG"
+  fi
+  echo "$date,$time,$filename,$duration,$language,$word_count,$tokens_in,$tokens_out,$cost_eur" >> "$COSTS_LOG"
+
   echo -e "${GREEN}   ✅ Gespeichert:${NC} ${date}_${basename}.md"
   echo "      Dauer: $duration | Sprache: $language | Wörter: $word_count"
-  notify "✅ Transkript fertig" "$filename · $duration · $word_count Wörter"
+  echo "      Tokens: ${tokens_in}↑ ${tokens_out}↓ | Kosten: ${cost_eur}€"
+  notify "✅ Transkript fertig" "$filename · $duration · ${cost_eur}€"
 
   rm -rf "$tmp_dir"
 
@@ -241,6 +276,29 @@ start_watch() {
 check_dependencies
 
 case "$1" in
+  --costs)
+    if [ ! -f "$COSTS_LOG" ]; then
+      echo "Noch keine Transkripte verarbeitet."
+      exit 0
+    fi
+    python3 - "$COSTS_LOG" << 'PYEOF'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+if not rows:
+    print("Log ist leer.")
+    sys.exit()
+total_eur  = sum(float(r['cost_eur'])   for r in rows)
+total_in   = sum(int(r['tokens_in'])    for r in rows)
+total_out  = sum(int(r['tokens_out'])   for r in rows)
+print(f"\n{'Datum':<12} {'Datei':<35} {'Dauer':<8} {'Tokens':>10}  {'Kosten':>8}")
+print("─" * 80)
+for r in rows:
+    tokens = f"{r['tokens_in']}↑{r['tokens_out']}↓"
+    print(f"{r['date']:<12} {r['source'][:34]:<35} {r['duration']:<8} {tokens:>10}  {float(r['cost_eur']):.4f}€")
+print("─" * 80)
+print(f"{'Gesamt: ' + str(len(rows)) + ' Transkripte':<57} {total_in}↑{total_out}↓  {total_eur:.4f}€\n")
+PYEOF
+    ;;
   --watch)
     command -v fswatch &>/dev/null || {
       echo -e "${RED}❌ fswatch fehlt. Installieren mit: brew install fswatch${NC}"
@@ -253,6 +311,7 @@ case "$1" in
     echo "  ./transcribe.sh audio.mp3"
     echo "  ./transcribe.sh meeting_medium.m4a   # Modell per Dateiname"
     echo "  ./transcribe.sh --watch"
+    echo "  ./transcribe.sh --costs              # Kosten-Übersicht"
     exit 1
     ;;
   *)
