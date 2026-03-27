@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.6.0] — 2026-03-27
+
+### Added
+- **Speaker Diarization** via `pyannote/speaker-diarization-3.1`: erkennt automatisch wer spricht
+  - Aktiviert sich wenn `HF_TOKEN` gesetzt und `pyannote.audio` installiert ist
+  - Fallback auf Plain-Text wenn Voraussetzungen fehlen (kein Breaking Change)
+  - MPS-Beschleunigung auf Apple Silicon automatisch genutzt
+  - Sprecher werden als „Sprecher A / B / C" bezeichnet
+- `speakers: N` im Frontmatter wenn Diarization aktiv
+- Whisper gibt jetzt JSON + TXT aus (JSON liefert Timestamps für Sprecherzuweisung)
+- `diarization_available()` Helper — check einmalig pro Run, kein Overhead wenn inaktiv
+
+### Setup (optional)
+```bash
+pip install pyannote.audio
+# HuggingFace-Token + Modell-Terms: huggingface.co/pyannote/speaker-diarization-3.1
+echo 'export HF_TOKEN=hf_...' >> ~/.zshrc
+```
+
+---
+
 ## [1.5.0] — 2026-03-27
 
 ### Changed

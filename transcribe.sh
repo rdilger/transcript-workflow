@@ -49,6 +49,10 @@ model_from_filename() {
   fi
 }
 
+diarization_available() {
+  [ -n "$HF_TOKEN" ] && python3 -c "import pyannote.audio" 2>/dev/null
+}
+
 check_dependencies() {
   local missing=()
   command -v whisper &>/dev/null || missing+=("whisper (brew install openai-whisper)")
@@ -64,6 +68,100 @@ check_dependencies() {
     for dep in "${missing[@]}"; do echo "  - $dep"; done
     exit 1
   fi
+
+  if diarization_available; then
+    echo -e "${GREEN}   Speaker-Diarization aktiv${NC}"
+  fi
+}
+
+# ── Speaker-Diarization ──────────────────────────────────────────────────────
+
+# Gibt Speaker-annotierten Transkript-Text aus.
+# Erwartet Whisper-JSON ($1) und Audio-Datei ($2).
+# Fällt auf Plain-Text zurück wenn Diarization fehlschlägt.
+build_speaker_transcript() {
+  local whisper_json="$1"
+  local audio_file="$2"
+
+  python3 - "$whisper_json" "$audio_file" "$HF_TOKEN" << 'PYEOF'
+import json, sys, re
+
+whisper_json, audio_file, hf_token = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(whisper_json) as f:
+    whisper_data = json.load(f)
+segments = whisper_data.get("segments", [])
+
+# Ohne Diarization: Plain-Text aus Segmenten zusammensetzen
+def plain_text():
+    return " ".join(s["text"].strip() for s in segments)
+
+if not hf_token:
+    print(plain_text())
+    sys.exit(0)
+
+try:
+    from pyannote.audio import Pipeline
+    import torch
+except ImportError:
+    print(plain_text())
+    sys.exit(0)
+
+try:
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        use_auth_token=hf_token
+    ).to(torch.device(device))
+
+    diarization = pipeline(audio_file)
+except Exception as e:
+    print(plain_text(), file=sys.stderr)
+    print(plain_text())
+    sys.exit(0)
+
+# Speaker-Segmente einlesen
+spk_segments = [
+    (turn.start, turn.end, spk)
+    for turn, _, spk in diarization.itertracks(yield_label=True)
+]
+
+# Sprecherzuweisung per Segment-Mittelpunkt
+def speaker_at(start, end):
+    mid = (start + end) / 2
+    for s, e, spk in spk_segments:
+        if s <= mid <= e:
+            return spk
+    # Fallback: nächstes Segment
+    best = min(spk_segments, key=lambda x: min(abs(x[0]-mid), abs(x[1]-mid)), default=None)
+    return best[2] if best else "Speaker"
+
+# Beschriftungen: SPEAKER_00 → "Sprecher A", SPEAKER_01 → "Sprecher B" ...
+labels = {}
+counter = 0
+def label(spk):
+    global counter
+    if spk not in labels:
+        labels[spk] = f"Sprecher {chr(65 + counter)}"
+        counter += 1
+    return labels[spk]
+
+# Segmente zusammenführen — gleicher Sprecher in Folge wird verbunden
+result = []
+cur_spk, cur_text = None, []
+for seg in segments:
+    spk = speaker_at(seg["start"], seg["end"])
+    if spk != cur_spk:
+        if cur_text:
+            result.append(f"**{label(cur_spk)}**: {' '.join(cur_text)}")
+        cur_spk, cur_text = spk, [seg["text"].strip()]
+    else:
+        cur_text.append(seg["text"].strip())
+if cur_text:
+    result.append(f"**{label(cur_spk)}**: {' '.join(cur_text)}")
+
+print("\n\n".join(result))
+PYEOF
 }
 
 # ── API-Aufruf ───────────────────────────────────────────────────────────────
@@ -233,13 +331,15 @@ process_file() {
   duration=$(get_duration "$audio_file")
 
   echo "   🎙️  Transkribiere..."
+  local whisper_formats="txt,json"
   whisper "$audio_file" \
     --model "$model" \
-    --output_format txt \
+    --output_format "$whisper_formats" \
     --output_dir "$tmp_dir" 2>"$tmp_dir/whisper.log"
 
-  local txt_file
-  txt_file=$(find "$tmp_dir" -name "*.txt" | head -1)
+  local txt_file json_file
+  txt_file=$(find "$tmp_dir" -name "*.txt"  | head -1)
+  json_file=$(find "$tmp_dir" -name "*.json" | head -1)
 
   if [ ! -f "$txt_file" ]; then
     echo -e "${RED}   ❌ Transkription fehlgeschlagen${NC}"
@@ -248,8 +348,14 @@ process_file() {
     return 1
   fi
 
+  # Speaker-Diarization wenn verfügbar, sonst Plain-Text
   local transcript
-  transcript=$(cat "$txt_file")
+  if diarization_available && [ -f "$json_file" ]; then
+    echo "   🗣️  Erkenne Sprecher..."
+    transcript=$(build_speaker_transcript "$json_file" "$audio_file")
+  else
+    transcript=$(cat "$txt_file")
+  fi
 
   # Sprache aus Whisper-Log
   local language
@@ -290,6 +396,10 @@ print('[' + ', '.join(tags) + ']')
   fi
   output_file="$OUTPUT_DIR/${date}_${slug}.md"
 
+  local speakers
+  speakers=$(echo "$transcript" | grep -o '\*\*Sprecher [A-Z]\*\*' | sort -u | wc -l | tr -d ' ')
+  [ "$speakers" -eq 0 ] 2>/dev/null && speakers=""
+
   cat > "$output_file" << EOF
 ---
 date: $date
@@ -301,6 +411,7 @@ model: $model
 duration: "$duration"
 language: $language
 word_count: $word_count
+${speakers:+speakers: $speakers}
 tokens_in: $tokens_in
 tokens_out: $tokens_out
 cost_eur: $cost_eur
