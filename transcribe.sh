@@ -472,6 +472,11 @@ start_watch() {
   echo "   (Ctrl+C zum Beenden)"
   echo ""
 
+  # Bereits vorhandene Dateien beim Start verarbeiten
+  for file in "$AUDIO_WATCH_FOLDER"/*.{mp3,mp4,m4a,wav,ogg,flac,webm,opus}; do
+    [ -f "$file" ] && process_file "$file"
+  done
+
   fswatch -0 "$AUDIO_WATCH_FOLDER" | while IFS= read -r -d '' file; do
     if [[ "$file" =~ \.(mp3|mp4|m4a|wav|ogg|flac|webm|opus)$ ]]; then
       if [[ "$file" != *"/processed/"* ]]; then

@@ -193,6 +193,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             updateIcon()
             buildMenu()
             notify(title: "🔴 Aufnahme läuft", message: "Klicke auf 🔴 zum Stoppen")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                self.notify(title: "⚠️ Video-Call-Mikrofon prüfen", message: "Transcript_Input ist aktiv — in Meet/Hangouts/Zoom explizit Scarlett 2i2 wählen")
+            }
         } catch {
             notify(title: "Fehler", message: "Aufnahme konnte nicht gestartet werden")
         }
