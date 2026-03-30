@@ -85,11 +85,24 @@ App beim Mac-Start automatisch starten:
 - Watch-Dienst transkribiert automatisch
 - `.md` erscheint in `Obsidian Vault/Transcripts/`
 
+> **⚠️ Hinweis für Video-Calls (Meet, Hangouts, Zoom):**
+> `Transcript_Input` ist als System-Standard-Eingabegerät gesetzt. Video-Call-Tools übernehmen diesen Standard und senden dadurch u.U. Stille. Beim Start einer Aufnahme erscheint automatisch ein Reminder — in der jeweiligen App immer explizit das echte Mikrofon (z.B. Scarlett 2i2) auswählen.
+
 ### Manuell transkribieren
 
 ```bash
 ~/scripts/transcribe.sh /pfad/zur/audio.mp3
 ```
+
+### Datei nachträglich importieren
+
+Liegt eine Datei bereits in `~/Desktop/AudioInput/` (z.B. weil der Watch-Dienst nicht lief), einfach manuell anstoßen:
+
+```bash
+~/scripts/transcribe.sh ~/Desktop/AudioInput/recording.m4a
+```
+
+Alternativ den Watch-Dienst neu starten — er verarbeitet beim Start automatisch alle noch vorhandenen Dateien im Ordner.
 
 ### Unterstützte Formate
 
@@ -138,11 +151,13 @@ tags: [transcript]
 - [ ] Obsidian MCP Integration (Claude Code Vault-Zugriff)
 - [ ] Frontmatter erweitern (duration, word_count, language, Links)
 - [ ] Speaker Diarization (verschiedene Sprecher unterscheiden)
-- [ ] Modell per Dateiname steuern (`meeting_medium.m4a`)
-- [ ] Kosten-Tracking pro Transkript
-- [ ] Fehler-Notifications via macOS
+- [x] Modell per Dateiname steuern (`meeting_medium.m4a`)
+- [x] Kosten-Tracking pro Transkript
+- [x] Fehler-Notifications via macOS
 - [ ] Processed-Ordner Bug bei iCloud fixen
-- [ ] Summary Qualität verbessern
+- [x] Summary Qualität verbessern
+- [x] Vorhandene Dateien beim Watch-Start automatisch verarbeiten
+- [x] Mikrofon-Warnung bei Aufnahmestart (Video-Call-Konflikt)
 
 ## Kosten
 
