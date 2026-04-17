@@ -41,6 +41,10 @@ command -v python3 &>/dev/null \
   && pass "python3 verfügbar ($(python3 --version 2>&1))" \
   || fail "python3 fehlt"
 
+python3 -c "import anthropic" 2>/dev/null \
+  && pass "anthropic SDK installiert ($(python3 -c 'import anthropic; print(anthropic.__version__)'))" \
+  || fail "anthropic SDK fehlt → pip3 install anthropic"
+
 echo ""
 
 # ── 2. API KEY ───────────────────────────────────────────────────────────────
@@ -62,39 +66,37 @@ echo "[ API Verbindung ]"
 if [ -z "$ANTHROPIC_API_KEY" ]; then
   warn "API-Test übersprungen (kein Key)"
 else
-  HTTP_STATUS=$(python3 - <<'EOF'
-import urllib.request, json, os, sys
-
-payload = json.dumps({
-    "model": "claude-haiku-4-5-20251001",
-    "max_tokens": 10,
-    "messages": [{"role": "user", "content": "ping"}]
-}).encode()
-
-req = urllib.request.Request(
-    "https://api.anthropic.com/v1/messages",
-    data=payload,
-    headers={
-        "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
-)
+  API_RESULT=$(python3 - <<'EOF'
+import os, sys
 try:
-    with urllib.request.urlopen(req, timeout=10) as r:
-        print(r.status)
-except urllib.error.HTTPError as e:
-    print(e.code)
+    import anthropic
+except ImportError:
+    print("NO_SDK")
+    sys.exit()
+
+try:
+    client = anthropic.Anthropic()
+    client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=10,
+        messages=[{"role": "user", "content": "ping"}]
+    )
+    print("OK")
+except anthropic.AuthenticationError:
+    print("AUTH")
+except anthropic.RateLimitError:
+    print("RATE")
 except Exception as e:
-    print("ERR")
+    print(f"ERR:{e}")
 EOF
 )
 
-  case "$HTTP_STATUS" in
-    200) pass "Claude API erreichbar (HTTP 200)" ;;
-    401) fail "API Key ungültig (HTTP 401)" ;;
-    429) warn "Rate-Limit erreicht (HTTP 429)" ;;
-    *)   fail "API nicht erreichbar (Status: $HTTP_STATUS)" ;;
+  case "$API_RESULT" in
+    OK)      pass "Claude API erreichbar (Anthropic SDK)" ;;
+    AUTH)    fail "API Key ungültig (AuthenticationError)" ;;
+    RATE)    warn "Rate-Limit erreicht (RateLimitError)" ;;
+    NO_SDK)  fail "anthropic SDK nicht installiert — API-Test übersprungen" ;;
+    *)       fail "API nicht erreichbar: $API_RESULT" ;;
   esac
 fi
 
