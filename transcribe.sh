@@ -1,14 +1,14 @@
 #!/bin/bash
 # transcribe.sh — Audio → Transkript + Summary → Obsidian
 
-VAULT="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault"
-TRANSCRIPT_FOLDER="Transcripts"
-AUDIO_WATCH_FOLDER="$HOME/Desktop/AudioInput"
-PROCESSED_FOLDER="$HOME/Desktop/AudioInput/processed"
+VAULT="${VAULT:-$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault}"
+TRANSCRIPT_FOLDER="${TRANSCRIPT_FOLDER:-Transcripts}"
+AUDIO_WATCH_FOLDER="${AUDIO_WATCH_FOLDER:-$HOME/Desktop/AudioInput}"
+PROCESSED_FOLDER="${PROCESSED_FOLDER:-$HOME/Desktop/AudioInput/processed}"
 OUTPUT_DIR="$VAULT/$TRANSCRIPT_FOLDER"
-WHISPER_MODEL="small"
-COSTS_LOG="$HOME/Desktop/AudioInput/costs.csv"
-PROCESSED_REGISTRY="$HOME/Desktop/AudioInput/.processed_registry"
+WHISPER_MODEL="${WHISPER_MODEL:-small}"
+COSTS_LOG="${COSTS_LOG:-$HOME/Desktop/AudioInput/costs.csv}"
+PROCESSED_REGISTRY="${PROCESSED_REGISTRY:-$HOME/Desktop/AudioInput/.processed_registry}"
 
 # Claude Haiku 4.5 Preise (USD pro Token) — bei Preisänderung hier anpassen
 HAIKU_PRICE_IN=0.0000008         # $0.80 / 1M Input-Tokens (uncached)
