@@ -8,10 +8,13 @@ PROCESSED_FOLDER="$HOME/Desktop/AudioInput/processed"
 OUTPUT_DIR="$VAULT/$TRANSCRIPT_FOLDER"
 WHISPER_MODEL="small"
 COSTS_LOG="$HOME/Desktop/AudioInput/costs.csv"
+PROCESSED_REGISTRY="$HOME/Desktop/AudioInput/.processed_registry"
 
-# Claude Haiku Preise (USD pro Token) — bei Preisänderung hier anpassen
-HAIKU_PRICE_IN=0.0000008    # $0.80 / 1M Input-Tokens
-HAIKU_PRICE_OUT=0.000004    # $4.00 / 1M Output-Tokens
+# Claude Haiku 4.5 Preise (USD pro Token) — bei Preisänderung hier anpassen
+HAIKU_PRICE_IN=0.0000008         # $0.80 / 1M Input-Tokens (uncached)
+HAIKU_PRICE_CACHE_WRITE=0.000001 # $1.00 / 1M Cache-Write-Tokens
+HAIKU_PRICE_CACHE_READ=0.00000008 # $0.08 / 1M Cache-Read-Tokens (~90% günstiger)
+HAIKU_PRICE_OUT=0.000004         # $4.00 / 1M Output-Tokens
 EUR_USD=0.92
 
 GREEN='\033[0;32m'
@@ -53,10 +56,19 @@ diarization_available() {
   [ -n "$HF_TOKEN" ] && python3 -c "import pyannote.audio" 2>/dev/null
 }
 
+# Registry to prevent double-processing when iCloud re-triggers fswatch
+is_processed() {
+  [ -f "$PROCESSED_REGISTRY" ] && grep -qxF "$1" "$PROCESSED_REGISTRY"
+}
+mark_processed() {
+  echo "$1" >> "$PROCESSED_REGISTRY"
+}
+
 check_dependencies() {
   local missing=()
   command -v whisper &>/dev/null || missing+=("whisper (brew install openai-whisper)")
   command -v ffmpeg  &>/dev/null || missing+=("ffmpeg (brew install ffmpeg)")
+  python3 -c "import anthropic" 2>/dev/null || missing+=("anthropic (pip3 install anthropic)")
 
   if [ -z "$ANTHROPIC_API_KEY" ]; then
     echo -e "${RED}❌ ANTHROPIC_API_KEY nicht gesetzt.${NC}"
@@ -166,100 +178,152 @@ PYEOF
 
 # ── API-Aufruf ───────────────────────────────────────────────────────────────
 
-# Analysiert Transkript via Claude.
+# Analysiert Transkript via Claude (Anthropic SDK, Prompt Caching aktiv).
 # Schreibt Markdown-Summary auf stdout.
 # Schreibt erweiterte Metadaten (tokens + title + topics) als JSON nach $2.
+# Args: $1=transcript $2=usage_file $3=duration $4=language $5=word_count $6=has_speakers (0|1)
 get_summary() {
   local transcript="$1"
   local usage_file="$2"
-  USAGE_FILE="$usage_file" python3 -c "
-import json, urllib.request, os, sys, re
+
+  # Write Python to a temp file so stdin stays free for the transcript
+  local py_script
+  py_script=$(mktemp /tmp/transcribe_summary_XXXXXX.py)
+
+  cat > "$py_script" <<'PYEOF'
+import json, os, sys, re
+import anthropic
 
 transcript = sys.stdin.read()
-usage_file = os.environ.get('USAGE_FILE', '')
+usage_file    = os.environ.get('USAGE_FILE', '')
+duration      = os.environ.get('DURATION', 'unknown')
+language      = os.environ.get('LANGUAGE', 'unknown')
+word_count    = int(os.environ.get('WORD_COUNT', '0'))
+has_speakers  = os.environ.get('HAS_SPEAKERS', '0') == '1'
 
-system_prompt = '''Du bist ein präziser Assistent für Audio-Transkript-Analyse.
-Regeln:
-- Antworte immer in der Sprache des Transkripts
-- Schreibe nur was tatsächlich im Transkript steht — keine Ergänzungen
-- Bei sehr kurzem oder unklarem Inhalt: schreib das kurz in die Zusammenfassung'''
+# Quality signal: flag thin/noisy transcripts
+low_quality = word_count < 50 or transcript.lower().count('[inaudible]') > 3
 
-user_prompt = '''Analysiere das folgende Transkript und antworte ausschließlich mit einem JSON-Objekt in diesem Format:
+# Build context header for the user prompt
+context_parts = [f'Aufnahmedauer: {duration}', f'Sprache: {language}', f'Wörter: {word_count}']
+if has_speakers:
+    context_parts.append('Mehrere Sprecher erkannt (Sprecher A / B / C…)')
+if low_quality:
+    context_parts.append('Hinweis: Transkriptqualität niedrig (kurz oder unverständliche Stellen)')
+context_block = ' | '.join(context_parts)
 
-{
-  \"title\": \"Aussagekräftiger Titel (max 60 Zeichen, keine Sonderzeichen außer Bindestrich, keine einzelnen Zahlen oder Buchstaben)\",
-  \"topics\": [\"thema1\", \"thema2\"],
-  \"summary\": \"1-3 Sätze: Kern des Gesprächs\",
-  \"key_points\": [\"Wichtigster Punkt\", \"Zweiter Punkt\"],
-  \"action_items\": [\"Aufgabe 1\"]
-}
-
-Hinweise:
-- topics: 2-5 Schlagworte, kleingeschrieben, auf Englisch oder Deutsch
-- key_points: mindestens 2, maximal 6 Punkte
-- action_items: nur wenn konkrete Aufgaben/Entscheidungen vorhanden, sonst leeres Array []
-- Antworte NUR mit dem JSON, kein Text davor oder danach
-
-Transkript:
-''' + transcript
-
-payload = json.dumps({
-    'model': 'claude-haiku-4-5-20251001',
-    'max_tokens': 1200,
-    'system': system_prompt,
-    'messages': [{'role': 'user', 'content': user_prompt}]
-}).encode()
-
-req = urllib.request.Request(
-    'https://api.anthropic.com/v1/messages',
-    data=payload,
-    headers={
-        'x-api-key': os.environ['ANTHROPIC_API_KEY'],
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
-    }
+# Per-speaker summary instruction (only when diarization was active)
+speaker_instruction = (
+    '\n- speaker_summaries: Objekt mit einem Eintrag pro Sprecher (z.B. {"Sprecher A": "...", "Sprecher B": "..."}) — '
+    'nur wenn mehrere Sprecher vorhanden, sonst weglassen\n'
+    if has_speakers else ''
 )
+speaker_json_field = (
+    '\n  "speaker_summaries": {"Sprecher A": "Beitrag in 1 Satz", "Sprecher B": "Beitrag in 1 Satz"},'
+    if has_speakers else ''
+)
+
+client = anthropic.Anthropic()
+
 try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.load(r)
-except urllib.error.HTTPError as e:
-    print(f'API-Fehler: HTTP {e.code} — {e.reason}', file=sys.stderr)
+    response = client.messages.create(
+        model='claude-haiku-4-5-20251001',
+        max_tokens=1500,
+        system=[{
+            'type': 'text',
+            'text': (
+                'Du bist ein präziser Assistent für Audio-Transkript-Analyse.\n'
+                'Regeln:\n'
+                '- Antworte immer in der Sprache des Transkripts\n'
+                '- Schreibe nur was tatsächlich im Transkript steht — keine Ergänzungen\n'
+                '- Bei sehr kurzem oder unklarem Inhalt: beschreibe kurz die Einschränkung in der Zusammenfassung\n'
+                '- Passe die Ausführlichkeit der Aufnahmedauer an: kurze Aufnahmen → knappe Zusammenfassung'
+            ),
+            'cache_control': {'type': 'ephemeral'}
+        }],
+        messages=[{
+            'role': 'user',
+            'content': (
+                f'Kontext: {context_block}\n\n'
+                'Analysiere das folgende Transkript und antworte ausschließlich mit einem '
+                'JSON-Objekt in diesem Format:\n\n'
+                '{\n'
+                '  "title": "Aussagekräftiger Titel (max 60 Zeichen, keine Sonderzeichen außer Bindestrich)",'
+                + speaker_json_field + '\n'
+                '  "topics": ["thema1", "thema2"],\n'
+                '  "summary": "1-3 Sätze: Kern des Gesprächs",\n'
+                '  "key_points": ["Wichtigster Punkt", "Zweiter Punkt"],\n'
+                '  "action_items": ["Aufgabe 1"]\n'
+                '}\n\n'
+                'Hinweise:\n'
+                '- topics: 2-5 Schlagworte, kleingeschrieben, auf Englisch oder Deutsch\n'
+                '- key_points: mindestens 2, maximal 6 Punkte\n'
+                '- action_items: nur wenn konkrete Aufgaben/Entscheidungen vorhanden, sonst leeres Array []\n'
+                + speaker_instruction +
+                '- Antworte NUR mit dem JSON, kein Text davor oder danach\n\n'
+                f'Transkript:\n{transcript}'
+            )
+        }]
+    )
+except anthropic.APIStatusError as e:
+    print(f'API-Fehler: HTTP {e.status_code} — {e.message}', file=sys.stderr)
     sys.exit(1)
-except Exception as e:
+except anthropic.APIConnectionError as e:
     print(f'API nicht erreichbar: {e}', file=sys.stderr)
     sys.exit(1)
 
-usage = data.get('usage', {})
-raw = data['content'][0]['text'].strip()
+usage = response.usage
+raw = response.content[0].text.strip()
 
 # JSON aus Antwort extrahieren (falls Claude doch Text drumherum schreibt)
 match = re.search(r'\{.*\}', raw, re.DOTALL)
 parsed = json.loads(match.group()) if match else {}
 
-title    = parsed.get('title', '')
-topics   = parsed.get('topics', [])
-summary  = parsed.get('summary', '')
-points   = parsed.get('key_points', [])
-actions  = parsed.get('action_items', [])
+title            = parsed.get('title', '')
+topics           = parsed.get('topics', [])
+summary          = parsed.get('summary', '')
+points           = parsed.get('key_points', [])
+actions          = parsed.get('action_items', [])
+speaker_summaries = parsed.get('speaker_summaries', {})
 
-# Metadaten für Bash
+# Metadaten für Bash (inkl. Cache-Token-Counts)
 if usage_file:
     with open(usage_file, 'w') as f:
-        json.dump({**usage, 'title': title, 'topics': topics}, f)
+        json.dump({
+            'input_tokens':                usage.input_tokens,
+            'output_tokens':               usage.output_tokens,
+            'cache_creation_input_tokens': getattr(usage, 'cache_creation_input_tokens', 0) or 0,
+            'cache_read_input_tokens':     getattr(usage, 'cache_read_input_tokens', 0) or 0,
+            'title':  title,
+            'topics': topics,
+        }, f)
 
 # Markdown-Body ausgeben
 md = f'## Zusammenfassung\n{summary}\n\n## Kernpunkte\n'
 md += '\n'.join(f'- {p}' for p in points)
+if speaker_summaries:
+    md += '\n\n## Sprecher\n'
+    md += '\n'.join(f'- **{spk}**: {desc}' for spk, desc in speaker_summaries.items())
 if actions:
     md += '\n\n## Action Items\n' + '\n'.join(f'- {a}' for a in actions)
 print(md)
-" <<< "$transcript" 2>&1 || echo "Zusammenfassung nicht verfügbar."
+PYEOF
+
+  USAGE_FILE="$usage_file" DURATION="$3" LANGUAGE="$4" WORD_COUNT="$5" HAS_SPEAKERS="$6" \
+    python3 "$py_script" <<< "$transcript" 2>&1
+  local exit_code=$?
+  rm -f "$py_script"
+  [ $exit_code -ne 0 ] && echo "Zusammenfassung nicht verfügbar."
+  return $exit_code
 }
 
 calc_cost_eur() {
-  local tokens_in="$1" tokens_out="$2"
+  local tokens_in="$1" tokens_out="$2" cache_write="${3:-0}" cache_read="${4:-0}"
   python3 -c "
-cost_usd = $tokens_in * $HAIKU_PRICE_IN + $tokens_out * $HAIKU_PRICE_OUT
+cost_usd = ($tokens_in * $HAIKU_PRICE_IN
+          + $tokens_out * $HAIKU_PRICE_OUT
+          + $cache_write * $HAIKU_PRICE_CACHE_WRITE
+          + $cache_read * $HAIKU_PRICE_CACHE_READ)
 print(f'{cost_usd * $EUR_USD:.4f}')
 "
 }
@@ -329,6 +393,12 @@ process_file() {
   local output_file="$OUTPUT_DIR/${date}_${basename}.md"
   local tmp_dir=$(mktemp -d)
 
+  # Guard against double-processing (iCloud re-triggers fswatch after archiving)
+  if is_processed "$filename"; then
+    echo -e "${YELLOW}   ↩ Bereits verarbeitet:${NC} $filename"
+    return 0
+  fi
+
   echo -e "${YELLOW}⏳ Verarbeite:${NC} $filename (Modell: $model)"
   mkdir -p "$OUTPUT_DIR"
   mkdir -p "$PROCESSED_FOLDER"
@@ -371,25 +441,31 @@ process_file() {
   local word_count
   word_count=$(echo "$transcript" | wc -w | tr -d ' ')
 
+  # Detect if diarization produced speaker labels
+  local has_speakers=0
+  echo "$transcript" | grep -q '\*\*Sprecher [A-Z]\*\*' && has_speakers=1
+
   echo "   🤖 Erstelle Zusammenfassung..."
   local summary
-  summary=$(get_summary "$transcript" "$tmp_dir/usage.json")
+  summary=$(get_summary "$transcript" "$tmp_dir/usage.json" "$duration" "$language" "$word_count" "$has_speakers")
 
   # Token-Nutzung, Kosten, Titel und Topics aus usage.json
-  local tokens_in=0 tokens_out=0 cost_eur="0.0000"
+  local tokens_in=0 tokens_out=0 cache_write=0 cache_read=0 cost_eur="0.0000"
   local title="" topics_yaml="[transcript]"
   if [ -f "$tmp_dir/usage.json" ]; then
-    IFS=$'\t' read -r tokens_in tokens_out title topics_yaml < <(python3 - "$tmp_dir/usage.json" << 'PYEOF'
+    IFS=$'\t' read -r tokens_in tokens_out cache_write cache_read title topics_yaml < <(python3 - "$tmp_dir/usage.json" << 'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 tin   = d.get('input_tokens', 0)
 tout  = d.get('output_tokens', 0)
+tcw   = d.get('cache_creation_input_tokens', 0)
+tcr   = d.get('cache_read_input_tokens', 0)
 title = d.get('title', '').replace('\t', ' ')
 tags  = '[' + ', '.join(['transcript'] + [t.lower().replace(' ', '-') for t in d.get('topics', [])]) + ']'
-print(f"{tin}\t{tout}\t{title}\t{tags}")
+print(f"{tin}\t{tout}\t{tcw}\t{tcr}\t{title}\t{tags}")
 PYEOF
     )
-    cost_eur=$(calc_cost_eur "$tokens_in" "$tokens_out")
+    cost_eur=$(calc_cost_eur "$tokens_in" "$tokens_out" "$cache_write" "$cache_read")
   fi
 
   # Dateiname: Titel wenn vorhanden, sonst Audio-Basename
@@ -401,11 +477,11 @@ PYEOF
   fi
   output_file="$OUTPUT_DIR/${date}_${slug}.md"
 
-  local speakers
-  speakers=$(echo "$transcript" | grep -o '\*\*Sprecher [A-Z]\*\*' | sort -u | wc -l | tr -d ' ')
-  [ "$speakers" -eq 0 ] 2>/dev/null && speakers=""
-  local speakers_line=""
-  [ -n "$speakers" ] && speakers_line="speakers: $speakers"
+  # Count distinct speakers for frontmatter
+  local speakers=""
+  if [ "$has_speakers" -eq 1 ]; then
+    speakers=$(echo "$transcript" | grep -o '\*\*Sprecher [A-Z]\*\*' | sort -u | wc -l | tr -d ' ')
+  fi
 
   # Frontmatter zusammenbauen — keine Leerzeilen, sauberes YAML
   {
@@ -419,7 +495,7 @@ PYEOF
     echo "duration: \"$duration\""
     echo "language: $language"
     echo "word_count: $word_count"
-    [ -n "$speakers_line" ] && echo "$speakers_line"
+    [ -n "$speakers" ] && echo "speakers: $speakers"
     echo "tokens_in: $tokens_in"
     echo "tokens_out: $tokens_out"
     echo "cost_eur: $cost_eur"
@@ -435,14 +511,9 @@ PYEOF
     echo "$transcript"
   } > "$output_file"
 
-$summary
-
----
-
-## Vollständiges Transkript
-
-$transcript
-EOF
+  # Register as processed before archiving — prevents iCloud-triggered re-runs
+  # even if the subsequent archive step fails
+  mark_processed "$filename"
 
   # Kosten-Log (CSV)
   if [ ! -f "$COSTS_LOG" ]; then
@@ -454,7 +525,9 @@ EOF
   echo -e "${GREEN}   ✅ Gespeichert:${NC} $outname"
   [ -n "$title" ] && echo "      Titel: $title"
   echo "      Dauer: $duration | Sprache: $language | Wörter: $word_count"
-  echo "      Tokens: ${tokens_in}↑ ${tokens_out}↓ | Kosten: ${cost_eur}€"
+  local cache_info=""
+  [ "$cache_read" -gt 0 ] 2>/dev/null && cache_info=" (cache hit: ${cache_read} tokens)"
+  echo "      Tokens: ${tokens_in}↑ ${tokens_out}↓${cache_info} | Kosten: ${cost_eur}€"
   notify "✅ Transkript fertig" "${title:-$filename} · $duration · ${cost_eur}€"
 
   rm -rf "$tmp_dir"
